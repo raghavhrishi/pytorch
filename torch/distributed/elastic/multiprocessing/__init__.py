@@ -106,6 +106,7 @@ def start_processes(
     logs_specs: LogsSpecs,
     log_line_prefixes: Optional[dict[int, str]] = None,
     start_method: str = "spawn",
+    numa_options: Optional[NumaOptions] = None,
 ) -> PContext:
     """
     Start ``n`` copies of ``entrypoint`` processes with the provided options.
@@ -214,6 +215,7 @@ def start_processes(
             envs=envs,
             logs_specs=logs_specs,
             log_line_prefixes=log_line_prefixes,
+            numa_options=numa_options,
         )
     else:
         context = MultiprocessContext(

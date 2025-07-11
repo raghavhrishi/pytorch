@@ -12,6 +12,7 @@ import re
 import shutil
 import socket
 import subprocess
+from abc import ABC, abstractmethod
 from argparse import ArgumentParser, REMAINDER
 from collections import defaultdict
 from enum import Enum
@@ -19,16 +20,10 @@ from enum import Enum
 import pynvml
 from torch.distributed.elastic.utils.logging import get_logger
 
-
-class AffinityMode(str, Enum):
-    NODE = "node"
-    SOCKET = "socket"
-    EXCLUSIVE = "exclusive"
-    CORE_COMPLEX = "core-complex"
-
-
 # Commands/Paths to get system-level information
-NUMA_CMD = "/sys/bus/pci/devices/{value}/numa_node"
+DEVICE_NUMA_NODE_ABSOLUTE_FILE_PATH_FORMAT = (
+    "/sys/bus/pci/devices/{domain}:{bus}:{device_func}/numa_node"
+)
 NUMA_CPU_MAP_CMD = "/sys/devices/system/node/node{value}/cpumap"
 CPU_MAP_CMD = '/proc/self/status | grep "Cpus_allowed:"'
 THREAD_SIBLINGS_CMD = "/sys/devices/system/cpu/cpu{value}/topology/thread_siblings"
@@ -42,66 +37,112 @@ PHYSICAL_PACKAGE_ID_CMD = (
 )
 POSSIBLE_NODES_CMD = "/sys/devices/system/node/possible"
 
+
+class AffinityMode(str, Enum):
+    NODE = "node"
+    SOCKET = "socket"
+    EXCLUSIVE = "exclusive"
+    CORE_COMPLEX = "core-complex"
+
+
+@dataclass(frozen=True)
+class NumaOptions:
+    affinity_mode: AffinityMode
+
+
 logger = get_logger(__name__)
 
 
+def wrap_command_with_numa_bindings(
+    *,
+    command_args: tuple[str],
+    gpu_index: int,
+    numa_options: NumaOptions,
+) -> tuple[str, tuple[str]]:
+    """
+    Args:
+        command_args: The args for a command, such as might be input to Popen.
+            Example: ("python", "trainer.py")
+        gpu_index: The index of the GPU used by the process.
+            Example: 0
+        numa_options: See NumaOptions for details.
+
+    Returns:
+        Depending on numa_options, something like
+            ("numactl", ("--cpunodebind=0", "--preferred=0", "python", "script.py"))
+    """
+
+    _throw_if_numactl_not_available()
+    if numa_options.affinity_mode == AffinityMode.NODE:
+        numactl_args = _get_numactl_args_for_node_affinity(gpu_index=gpu_index)
+    # elif numa_options.affinity_mode == AffinityMode.SOCKET:
+    #     numactl_args = _get_numactl_args_for_socket_affinity(gpu_index=gpu_index)
+    # elif numa_options.affinity_mode == AffinityMode.EXCLUSIVE:
+    #     numactl_args = _get_numactl_args_for_exclusive_affinity(gpu_index=gpu_index)
+    # elif numa_options.affinity_mode == AffinityMode.CORE_COMPLEX:
+    #     numactl_args = _get_numactl_args_for_core_complex(gpu_index=gpu_index)
+    else:
+        raise ValueError(f"Unknown affinity mode: {numa_options.affinity_mode}")
+
+    # Syntax for invoking a command but with numactl activated is numactl <args> command <args>
+    return (*numactl_args, *command_args)
+
+
+def _throw_if_numactl_not_available() -> None:
+    if not shutil.which("numactl"):
+        raise RuntimeError("numactl shell command is required for NUMA bindings.")
+
+
+def _get_numa_args_for_node_affinity(*, gpu_index: int) -> tuple[str]:
+    """
+    Implements NODE affinity strategy.
+
+    Returns a numactl command, minus the command it would normally execute. E.g.,
+    ("numactl", "--cpunodebind=0", "--preferred=0").
+    """
+    numa_node_index = _get_numa_node_index_for_gpu_index(gpu_index)
+
+    return (
+        "numactl",
+        f"--cpunodebind={numa_node_index}",
+        f"--preferred={numa_node_index}",
+    )
+
+
+def _get_numa_node_index_for_gpu_index(gpu_index: int) -> int:
+    handle = pynvml.nvmlDeviceGetHandleByIndex(gpu_index)
+    pci_info = pynvml.nvmlDeviceGetPciInfo(handle)
+    # Like 00000000:00:01.3
+    bus_id = pci_info.busId
+
+    # @nocommit print to make sure it's right
+    domain, bus, device_func = bus_id.split(":")
+    absolute_device_numa_node_path = DEVICE_NUMA_NODE_ABSOLUTE_FILE_PATH_FORMAT.format(
+        domain=domain[-4:], bus=bus, device_func=device_func
+    )
+
+    with open(numa_file) as f:
+        return int(f.read())
+
+
+# def _get_gpu_index() -> int:
+#     """
+#     NOTE: We assume that a process will only schedule work onto the GPU
+#     whose index matches the process's local rank. If this is not an accurate
+#     assumption, you should not use this module, because it is likely to be a pessimization
+#     compared to just skipping bindings or doing them manually.
+#     """
+#     return os.environ["LOCAL_RANK"]
+
+
+def _get_gpu_index_to_numa_node_index() -> list[int]:
+    return [
+        _get_numa_node_index_for_gpu_index(gpu_index)
+        for gpu_index in range(_get_system_gpu_count())
+    ]
+
+
 class System:
-    """
-    Abstracts system specific methods, so it could be mocked for unit tests, across various different types
-    of systems.
-    """
-
-    def __init__(self):
-        pass
-
-    def execute_command(self, cmd: str) -> str:
-        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, shell=True)
-        outs, errs = process.communicate()
-        if process.returncode != 0:
-            raise Exception(
-                f"command:{cmd}, return code:{process.returncode},stderr:{errs}"
-            )
-        return outs.decode("UTF-8")
-
-    # returns number of gpus
-    def get_gpu_count(self) -> int:
-        # Initialize NVML
-        pynvml.nvmlInit()
-        # Get the number of GPU devices
-        device_count = pynvml.nvmlDeviceGetCount()
-        # Shutdown NVML
-        pynvml.nvmlShutdown()
-        # outs = self.execute_command(NUM_GPUS_CMD)
-        return int(device_count)
-
-    # returns array indexed by GPU id and mapping to value NUMA node id
-    def get_numa_nodes(self) -> list[int]:
-        numaNodes = []
-        # Initialize NVML
-        pynvml.nvmlInit()
-        # Get the number of GPU devices
-        device_count = pynvml.nvmlDeviceGetCount()
-        # Retrieve and print PCI bus ID for each GPU
-        pciBusIDs = []
-        for i in range(device_count):
-            handle = pynvml.nvmlDeviceGetHandleByIndex(i)
-            pci_info = pynvml.nvmlDeviceGetPciInfo(handle)
-            bus_id = pci_info.busId.decode()  # Decode bytes to string
-            pciBusIDs.append(bus_id)
-        # Shutdown NVML
-        pynvml.nvmlShutdown()
-        for busID in pciBusIDs:
-            pciFields = busID.split(":")
-            pciDir = f"{pciFields[0][-4:]}:{pciFields[1]}:{pciFields[2]}"
-            numaFile = NUMA_CMD.format(value=pciDir.lower())
-            try:
-                with open(numaFile) as numa_node_text:
-                    node = int(numa_node_text.read())
-                    numaNodes.append(node)
-            except FileNotFoundError:
-                print(f"The file {numaFile} does not exist.")
-        return numaNodes
-
     # returns full set of CPUs affined to the NUMA node
     # includes reserved and non-reserved CPUs
     def get_numa_node_to_cpus(self, affinedNumaNode: int) -> int:
@@ -242,15 +283,6 @@ def get_local_rank(args) -> tuple[int, bool]:
     return int(local_rank), is_rank_required
 
 
-def check_numactl() -> str:
-    # Check if numactl is installed
-    numactl_path = shutil.which("numactl")
-    if not numactl_path:
-        # Throw an error if numactl is not available
-        raise RuntimeError("numactl is not installed")
-    return numactl_path
-
-
 def get_cmd(
     args, numactlargs: list[str], local_rank: int, is_rank_required: bool
 ) -> list[str]:
@@ -274,17 +306,11 @@ def run_cmd(cmd: list[str], env: dict[str, str]) -> None:
         process.wait()
 
 
-class Numa:
-    """
-    Base class for numa binding methods. defines common functions
-    """
-
-    def __init__(self, local_rank: int, system: System):
-        self.local_rank = local_rank
-        self.system = system
-        gpu_count = system.get_gpu_count()
-        if local_rank > gpu_count:
-            raise Exception("Local Rank is greater than the number of GPUs")
+class _NumaStrategy(ABC):
+    def wrap_command_with_numa_bindings(
+        *, command_args: tuple[str], gpu_index: int
+    ) -> tuple[str]:
+        pass
 
     def get_affined_gpus(self, numa_nodes: list[int]) -> tuple[int, int]:
         affinedNumaNode = numa_nodes[self.local_rank]
@@ -330,9 +356,6 @@ class Node(Numa):
     """
     implements node numa-binding
     """
-
-    def __init__(self, local_rank: int, system: System):
-        super().__init__(local_rank, system)
 
     def get_numactl_args(self) -> list[str]:
         numa_gpu = self.system.get_numa_nodes()

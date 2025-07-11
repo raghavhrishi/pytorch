@@ -811,6 +811,7 @@ class SubprocessContext(PContext):
         envs: dict[int, dict[str, str]],
         logs_specs: LogsSpecs,
         log_line_prefixes: Optional[dict[int, str]] = None,
+        numa_options: Optional[NumaOptions] = None,
     ):
         super().__init__(
             name,
@@ -825,6 +826,7 @@ class SubprocessContext(PContext):
         self._running_local_ranks: set[int] = set(range(self.nprocs))
         self._failures: dict[int, ProcessFailure] = {}
         self.subprocess_handlers: dict[int, SubprocessHandler] = {}
+        self._numa_options: Optional[NumaOptions] = None
 
     def _start(self):
         if self.subprocess_handlers:

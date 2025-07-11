@@ -86,6 +86,7 @@ class WorkerSpec:
     master_port: Optional[int] = None
     master_addr: Optional[str] = None
     local_addr: Optional[str] = None
+    numa_options: Optional[NumaOptions] = None
 
     def __post_init__(self):
         assert self.local_world_size > 0

@@ -24,7 +24,7 @@ from torch.distributed.elastic.multiprocessing.errors import ChildFailedError
 from torch.distributed.elastic.rendezvous import RendezvousParameters
 from torch.distributed.elastic.rendezvous.utils import parse_rendezvous_endpoint
 from torch.distributed.elastic.utils.logging import get_logger
-
+from torch.distributed.numa_binding import NumaOptions
 
 __all__ = ["LaunchConfig", "elastic_launch", "launch_agent"]
 
@@ -87,6 +87,7 @@ class LaunchConfig:
     log_line_prefix_template: Optional[str] = None
     metrics_cfg: dict[str, str] = field(default_factory=dict)
     local_addr: Optional[str] = None
+    numa_options: Optional[NumaOptions] = None
 
     def __post_init__(self):
         default_timeout = 900
@@ -98,6 +99,9 @@ class LaunchConfig:
         # Post-processing to enable refactoring to introduce logs_specs due to non-torchrun API usage
         if self.logs_specs is None:
             self.logs_specs = DefaultLogsSpecs()
+
+        if self.numa_options is not None and not isinstance(self.entrypoint, str):
+            raise ValueError("numa_options is only supported for str entrypoints.")
 
 
 class elastic_launch:
@@ -206,6 +210,7 @@ def launch_agent(
         "  monitor_interval : %(monitor_interval)s\n"
         "  log_dir          : %(log_dir)s\n"
         "  metrics_cfg      : %(metrics_cfg)s\n",
+        "  numa_options      : %(numa_options)s\n",
         {
             "entrypoint": entrypoint_name,
             "min_nodes": config.min_nodes,
@@ -219,6 +224,7 @@ def launch_agent(
             "monitor_interval": config.monitor_interval,
             "log_dir": config.logs_specs.root_log_dir,  # type: ignore[union-attr]
             "metrics_cfg": config.metrics_cfg,
+            "numa_options": config.numa_options,
         },
     )
 
@@ -245,6 +251,7 @@ def launch_agent(
         master_addr=master_addr,
         master_port=master_port,
         local_addr=config.local_addr,
+        numa_options=numa_options,
     )
 
     agent = LocalElasticAgent(

@@ -11,6 +11,8 @@ import subprocess
 import sys
 from typing import Any, Optional
 
+from torch.distributed.numa_binding import NumaOptions, wrap_command_with_numa_bindings
+
 
 __all__ = ["SubprocessHandler"]
 
@@ -39,6 +41,7 @@ class SubprocessHandler:
         stdout: Optional[str],
         stderr: Optional[str],
         local_rank_id: int,
+        numa_options: Optional[NumaOptions],
     ):
         self._stdout = open(stdout, "w") if stdout else None
         self._stderr = open(stderr, "w") if stderr else None
@@ -47,6 +50,15 @@ class SubprocessHandler:
         env_vars.update(env)
 
         args_str = (entrypoint, *[str(e) for e in args])
+        if numa_options is not None:
+            args_str = wrap_command_with_numa_bindings(
+                command_args=args_str,
+                # We assume that the local_rank_id process will work with the
+                # matching gpu_index. If this is not accurate in your case,
+                # you should not use numa_options.
+                gpu_index=local_rank_id,
+                numa_options=numa_options,
+            )
         self.local_rank_id = local_rank_id
         self.proc: subprocess.Popen = self._popen(args_str, env_vars)
 
